@@ -269,7 +269,7 @@ def train(args: TrainArgs):
 
     state_dict_config = FullStateDictConfig(offload_to_cpu=True, rank0_only=True)
     with FSDP.state_dict_type(model, StateDictType.FULL_STATE_DICT, state_dict_config):
-        state_dict = model.state_dict()
+        state_dict = fsdp_model.state_dict()
 
     if GLOBAL_RANK == 0:
         os.makedirs(args.output_dir)
