@@ -32,7 +32,7 @@ if TYPE_CHECKING:
 
 @dataclass
 class ModelArgs:
-    model_path: str = "Qwen/Qwen2.5-0.5B-Instruct"
+    model_path: str = "Qwen/Qwen2.5-7B-Instruct"
 
 
 @dataclass
@@ -278,6 +278,7 @@ def train(args: TrainArgs):
                     print(f"[rank {GLOBAL_RANK}]: {key}'s shape: {value.shape}, device: {value.device}, {value}")
 
             total_loss = 0
+            n_correct, n_total = 0, 0
             for micro_batch in micro_batches:
                 micro_batch = {k: v.cuda(non_blocking=True) for k, v in micro_batch.items()}
                 labels = micro_batch.pop("labels")
@@ -288,20 +289,32 @@ def train(args: TrainArgs):
                 loss.backward()
                 total_loss += loss.item()
 
+                n_correct += torch.where(labels != IGNORE_INDEX, logits.argmax(dim=-1) == labels, 0).sum().item()
+                n_total += (labels != IGNORE_INDEX).sum().item()
+
             grad_norm = fsdp_model.clip_grad_norm_(args.optim.max_grad_norm).item()
             optimizer.step()
             lr_scheduler.step()
             optimizer.zero_grad()
 
-            metrics = torch.tensor([total_loss, grad_norm], device="cuda")
+            metrics = torch.tensor([total_loss, grad_norm, n_correct, n_total], device="cuda")
             dist.all_reduce(metrics, op=dist.ReduceOp.SUM)
             total_loss, grad_norm = metrics[0].item() / WORLD_SIZE, metrics[1].item() / WORLD_SIZE
+            n_correct, n_total = metrics[2].item(), metrics[3].item()
+            accuracy = n_correct / n_total
             lr = max(lr_scheduler.get_last_lr())
-            data_loader_tqdm.set_postfix_str(f"loss: {total_loss:.2f}, grad_norm: {grad_norm:.2f}, lr: {lr:.2e}")
+            data_loader_tqdm.set_postfix_str(
+                f"loss: {total_loss:.2f}, grad_norm: {grad_norm:.2f}, lr: {lr:.2e}, accuracy: {accuracy:.2f}"
+            )
             data_loader_tqdm.update()
 
             if GLOBAL_RANK == 0:
-                train_metrics = {"training/loss": total_loss, "training/grad_norm": grad_norm, "training/lr": lr}
+                train_metrics = {
+                    "training/loss": total_loss,
+                    "training/grad_norm": grad_norm,
+                    "training/lr": lr,
+                    "training/accuracy": accuracy,
+                }
                 wandb.log(train_metrics, step=global_step)
 
         data_loader_tqdm.close()
