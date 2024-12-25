@@ -235,6 +235,7 @@ def train(args: TrainArgs):
         reduce_dtype=torch.float32,
         buffer_dtype=torch.float32,
     )
+    model = model.float()  # enable mixed precision training
     fsdp_model = FSDP(
         model,
         sharding_strategy=ShardingStrategy.FULL_SHARD,
