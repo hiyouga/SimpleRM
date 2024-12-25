@@ -1,6 +1,6 @@
 .PHONY: commit quality style
 
-check_dirs := main.py
+check_dirs := main.py inference.py
 
 commit:
 	pre-commit install

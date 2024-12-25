@@ -3,13 +3,15 @@ import os
 from collections import defaultdict
 from dataclasses import asdict, dataclass, field
 from functools import partial
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Sequence
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Sequence, Union
 
 import datasets
 import torch
 import torch.distributed as dist
+import torch.nn as nn
 import transformers
 import wandb
+from accelerate import init_empty_weights
 from datasets import load_dataset
 from omegaconf import OmegaConf
 from torch.distributed.fsdp import FullStateDictConfig, MixedPrecision, ShardingStrategy, StateDictType
@@ -20,7 +22,8 @@ from torch.utils.data import Dataset
 from torchdata.stateful_dataloader import StatefulDataLoader
 from torchdata.stateful_dataloader.sampler import StatefulDistributedSampler
 from tqdm import trange
-from transformers import AutoModelForTokenClassification, AutoTokenizer, PreTrainedModel, set_seed
+from transformers import AutoConfig, AutoModelForTokenClassification, AutoTokenizer, PreTrainedModel, set_seed
+from transformers.modeling_utils import no_init_weights
 
 
 if TYPE_CHECKING:
@@ -29,29 +32,30 @@ if TYPE_CHECKING:
 
 @dataclass
 class ModelArgs:
-    model_path: str = field(default="Qwen/Qwen2.5-0.5B-Instruct")
+    model_path: str = "Qwen/Qwen2.5-0.5B-Instruct"
 
 
 @dataclass
 class DataArgs:
-    train_data: str = field(default="RLHFlow/Mistral-ORM-Data")
+    train_data: str = "RLHFlow/Mistral-ORM-Data"
 
 
 @dataclass
 class OptimArgs:
-    lr: float = field(default=1e-5)
-    micro_batch_size: int = field(default=1)
-    global_batch_size: Optional[int] = field(default=None)
-    num_train_epochs: int = field(default=1)
-    max_grad_norm: float = field(default=1.0)
+    lr: float = 1e-5
+    micro_batch_size: int = 1
+    global_batch_size: Optional[int] = None
+    num_train_epochs: int = 1
+    max_steps: Optional[int] = None
+    max_grad_norm: float = 1.0
 
 
 @dataclass
 class TrainArgs:
-    output_dir: str = field(default="output")
-    seed: int = field(default=42)
-    wandb_project: str = field(default="RewardModel")
-    wandb_name: Optional[str] = field(default=None)
+    output_dir: str = "output"
+    seed: int = 42
+    wandb_project: str = "RewardModel"
+    wandb_name: Optional[str] = None
     model: "ModelArgs" = field(default_factory=ModelArgs)
     data: "DataArgs" = field(default_factory=DataArgs)
     optim: "OptimArgs" = field(default_factory=OptimArgs)
@@ -139,6 +143,28 @@ def print_rank0(*args):
         print(*args)
 
 
+def create_init_fn(model: "nn.Module", device: Union[str, "torch.device"]) -> Callable[["nn.Module"], None]:
+    param_occurrence = defaultdict(int)
+    for _, param in model.named_parameters(remove_duplicate=False):
+        param_occurrence[param] += 1
+
+    duplicated_params = {param for param in param_occurrence.keys() if param_occurrence[param] > 1}
+    materialized_params = {}
+
+    def init_fn(module: "nn.Module"):
+        for name, param in module.named_parameters(recurse=False):
+            if param in duplicated_params:
+                module._parameters[name] = materialized_params.setdefault(
+                    param, nn.Parameter(torch.empty_like(param.data, device=device), requires_grad=param.requires_grad)
+                )
+            else:
+                module._parameters[name] = nn.Parameter(
+                    torch.empty_like(param.data, device=device), requires_grad=param.requires_grad
+                )
+
+    return init_fn
+
+
 def train(args: TrainArgs):
     if args.optim.global_batch_size is None:
         args.optim.global_batch_size = args.optim.micro_batch_size * WORLD_SIZE
@@ -181,14 +207,24 @@ def train(args: TrainArgs):
         drop_last=True,
     )
 
-    model = AutoModelForTokenClassification.from_pretrained(
-        args.model.model_path,
-        num_labels=2,
-        torch_dtype=torch.bfloat16,
-        attn_implementation="flash_attention_2",
-        device_map="cpu",
-        low_cpu_mem_usage=True,
-    )
+    if GLOBAL_RANK == 0:
+        model = AutoModelForTokenClassification.from_pretrained(
+            args.model.model_path,
+            num_labels=2,
+            torch_dtype=torch.bfloat16,
+            attn_implementation="flash_attention_2",
+            device_map="cpu",
+            low_cpu_mem_usage=True,
+        )
+    else:
+        with no_init_weights(), init_empty_weights():
+            config = AutoConfig.from_pretrained(args.model.model_path, num_labels=2)
+            model = AutoModelForTokenClassification.from_config(
+                config,
+                torch_dtype=torch.bfloat16,
+                attn_implementation="flash_attention_2",
+            )
+
     assert isinstance(model, PreTrainedModel)  # lint
     model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
     wrap_policy = partial(
@@ -206,11 +242,14 @@ def train(args: TrainArgs):
         mixed_precision=mixed_precision,
         device_id=torch.cuda.current_device(),
         use_orig_params=False,  # true if has freeze params
+        sync_module_states=True,
+        param_init_fn=create_init_fn(model, device="cuda") if GLOBAL_RANK != 0 else None,
     )
 
+    train_steps = args.optim.max_steps if args.optim.max_steps else len(train_dataloader)
     trainable_params = filter(lambda p: p.requires_grad, model.parameters())
     optimizer = torch.optim.AdamW(trainable_params, args.optim.lr)
-    lr_scheduler = CosineAnnealingLR(optimizer, args.optim.num_train_epochs * len(train_dataloader))
+    lr_scheduler = CosineAnnealingLR(optimizer, args.optim.num_train_epochs * train_steps)
     loss_func = torch.nn.CrossEntropyLoss()
 
     if GLOBAL_RANK == 0:
@@ -224,13 +263,13 @@ def train(args: TrainArgs):
             train_dataloader.sampler.set_epoch(epoch)
 
         data_loader_tqdm = trange(
-            len(train_dataloader),
+            train_steps,
             desc=f"Epoch {epoch + 1}/{args.optim.num_train_epochs}",
             initial=start_step,
             disable=LOCAL_RANK != 0,
         )
         data_iterator = iter(train_dataloader)
-        for _ in range(start_step, len(train_dataloader)):
+        for _ in range(start_step, train_steps):
             global_step += 1
             micro_batches: List[Dict[str, "torch.Tensor"]] = next(data_iterator)
 
@@ -267,6 +306,7 @@ def train(args: TrainArgs):
 
         data_loader_tqdm.close()
 
+    torch.cuda.synchronize()
     state_dict_config = FullStateDictConfig(offload_to_cpu=True, rank0_only=True)
     with FSDP.state_dict_type(model, StateDictType.FULL_STATE_DICT, state_dict_config):
         state_dict = fsdp_model.state_dict()
