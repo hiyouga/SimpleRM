@@ -1,0 +1,5 @@
+datasets>=2.16.0,<=2.21.0
+omegaconf>=2.0,<3.0
+packaging>=23.0,<26.0
+torchdata>=0.8.0,<1.0
+transformers[torch]>=4.46.2,<4.47.0

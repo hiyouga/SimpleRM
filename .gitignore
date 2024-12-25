@@ -169,3 +169,13 @@ cython_debug/
 
 # PyPI configuration file
 .pypirc
+
+# ruff
+.ruff_cache/
+
+# wandb
+wandb/
+
+# misc
+log.txt
+output/
