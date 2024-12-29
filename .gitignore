@@ -179,3 +179,7 @@ wandb/
 # misc
 log.txt
 output/
+
+prm/configs/
+prm/scripts/
+prm/saves/
