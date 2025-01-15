@@ -1,0 +1,18 @@
+data:
+  prm_version: v2
+  train_data: /gpfs/public/align/qisenyang/lalala/SimpleRM/prm/prm_data/filtered_v2_data.json
+
+model:
+  model_path: /gpfs/public/01/models/hf_models/Qwen2.5-7B-Instruct
+  num_labels: 3
+
+optim:
+  lr: 1.0e-5
+  micro_batch_size: 4
+  global_batch_size: 384
+  num_train_epochs: 2
+
+output_dir: saves/4nodes_v2_filtered_qwen2d5_7b_instruct_as_base/full/sft_lr_1e-5_pdbs_4_gbs_768_2epochs
+seed: 42
+wandb_project: RewardModel
+wandb_name: prm_rm_head_4nodes_v2_filtered_qwen2d5_7b_instruct_as_base_full_sft_lr_1e-5_pdbs_4_gbs_768_2epochs

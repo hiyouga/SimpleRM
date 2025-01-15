@@ -18,6 +18,7 @@ from torch.distributed.fsdp import FullStateDictConfig, MixedPrecision, Sharding
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from torch.distributed.fsdp.wrap import lambda_auto_wrap_policy
 from torch.optim.lr_scheduler import CosineAnnealingLR
+from transformers import get_cosine_schedule_with_warmup
 from torch.utils.data import Dataset
 from torchdata.stateful_dataloader import StatefulDataLoader
 from torchdata.stateful_dataloader.sampler import StatefulDistributedSampler
@@ -50,6 +51,7 @@ class OptimArgs:
     num_train_epochs: int = 1
     max_steps: Optional[int] = None
     max_grad_norm: float = 1.0
+    warmup_ratio: Optional[float] = 0.0
 
 
 @dataclass
@@ -135,10 +137,16 @@ class RewardData(Dataset):
         for idx, id in enumerate(labels):
             if id == self._label_placeholder_id:
                 cur_seperate_token_num_in_labels += 1
-                if self._prm_version == 'v2':
+                if self._prm_version == 'v2' or self._prm_version == 'v2_place_holder':
                     labels[idx] = _convert_prm_label(prm_step_labels[cur_seperate_token_num_in_labels - 1])
                     cur_seperate_token_id_in_labels.append(idx)
                 elif self._prm_version == 'v6':
+                    if cur_seperate_token_num_in_labels == all_input_ids_seperate_token_num:
+                        labels[idx] = _convert_prm_label(prm_step_labels[0])
+                        cur_seperate_token_id_in_labels.append(idx)
+                    else:
+                        labels[idx] = IGNORE_INDEX
+                elif self._prm_version == 'v3':
                     if cur_seperate_token_num_in_labels == all_input_ids_seperate_token_num:
                         labels[idx] = _convert_prm_label(prm_step_labels[0])
                         cur_seperate_token_id_in_labels.append(idx)
@@ -157,9 +165,16 @@ class RewardData(Dataset):
                 if self._prm_version == 'v2':
                     input_ids[idx] = self._four_newline_id
                     cur_seperate_token_id_in_input_ids.append(idx)
+                elif self._prm_version == 'v2_place_holder':
+                    cur_seperate_token_id_in_input_ids.append(idx)
                 elif self._prm_version == 'v6':
                     input_ids[idx] = self._four_newline_id
                     if cur_seperate_token_num_in_input_ids == all_input_ids_seperate_token_num:
+                        cur_seperate_token_id_in_input_ids.append(idx)
+                elif self._prm_version == 'v3':
+                    input_ids[idx] = self._four_newline_id
+                    if cur_seperate_token_num_in_input_ids == all_input_ids_seperate_token_num:
+                        input_ids[idx] = self._tokenizer('<|label_placeholder|>')['input_ids'][0]
                         cur_seperate_token_id_in_input_ids.append(idx)
                 else:
                     raise ValueError(f'Invalid prm version: {self._prm_version}')
@@ -342,7 +357,12 @@ def train(args: TrainArgs):
     train_steps = args.optim.max_steps if args.optim.max_steps else len(train_dataloader)
     trainable_params = filter(lambda p: p.requires_grad, model.parameters())
     optimizer = torch.optim.AdamW(trainable_params, args.optim.lr)
-    lr_scheduler = CosineAnnealingLR(optimizer, args.optim.num_train_epochs * train_steps)
+    # lr_scheduler = CosineAnnealingLR(optimizer, args.optim.num_train_epochs * train_steps,)
+    lr_scheduler = get_cosine_schedule_with_warmup(
+        optimizer, 
+        num_warmup_steps=args.optim.warmup_ratio * train_steps * args.optim.num_train_epochs, 
+        num_training_steps=train_steps * args.optim.num_train_epochs,
+    )
     loss_func = torch.nn.CrossEntropyLoss()
 
     if GLOBAL_RANK == 0:
@@ -366,9 +386,9 @@ def train(args: TrainArgs):
             global_step += 1
             micro_batches: List[Dict[str, "torch.Tensor"]] = next(data_iterator)
 
-            if global_step == 1:
-                for key, value in micro_batches[0].items():
-                    print(f"[rank {GLOBAL_RANK}]: {key}'s shape: {value.shape}, device: {value.device}, {value}")
+            # if global_step == 1:
+            #     for key, value in micro_batches[0].items():
+            #         print(f"[rank {GLOBAL_RANK}]: {key}'s shape: {value.shape}, device: {value.device}, {value}")
 
             total_loss = 0
             n_correct, n_total = 0, 0
@@ -448,3 +468,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+# s1 \n\n\n\n s2 \n\n\n\n s3 \n\n\n\n ... sn \n\n\n\n
+# s1 <label_placeholder> s2 <label_placeholder> s3 <label_placeholder> ... sn <label_placeholder>
+# s1 \n\n\n\n s2 \n\n\n\n s3 \n\n\n\n ... sn <label_placeholder>

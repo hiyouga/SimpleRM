@@ -180,6 +180,7 @@ wandb/
 log.txt
 output/
 
-prm/configs/
+# prm/configs/
 prm/scripts/
 prm/saves/
+prm/prm_data/

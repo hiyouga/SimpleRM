@@ -1,0 +1,18 @@
+data:
+  prm_version: v6
+  train_data: /gpfs/public/align/qisenyang/lalala/prm_llama_factory/prm_data_process/v3_sft_data.json
+
+model:
+  model_path: /gpfs/public/01/models/hf_models/Qwen2.5-72B-Instruct
+  num_labels: 3
+
+optim:
+  lr: 5.0e-6
+  micro_batch_size: 4
+  global_batch_size: 768
+  num_train_epochs: 2
+
+output_dir: saves/8nodes_v6_qwen2d5_72b_instruct_as_base/full/sft_lr_5e-6_pdbs_4_gbs_768_2epochs
+seed: 42
+wandb_project: RewardModel
+wandb_name: prm_rm_head_8nodes_v6_qwen2d5_72b_instruct_as_base_full_sft_lr_5e-6_pdbs_4_gbs_768_2epochs
